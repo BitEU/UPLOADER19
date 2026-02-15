@@ -1,10 +1,10 @@
 [package]
-name    = "cnc_uploader"
+name    = "univac_uploader"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "cnc_uploader"
+name = "univac_uploader"
 path = "src/main.rs"
 
 [dependencies]

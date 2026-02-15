@@ -14,14 +14,15 @@ fn main() {
         std::process::exit(1);
     }
 
-    // ── Prompt: COM port ─────────────────────────────────────────────────────
-    let port_num: u8 = loop {
-        let s = prompt("COM PORT NUMBER (1-17)");
-        match s.trim().parse::<u8>() {
-            Ok(n) if (1..=17).contains(&n) => break n,
-            _ => eprintln!("Please enter a number between 1 and 17."),
-        }
-    };
+    // ── Prompt: serial port ──────────────────────────────────────────────────
+    #[cfg(target_os = "windows")]
+    let port_prompt = "COM PORT NUMBER (1-17)";
+    #[cfg(target_os = "linux")]
+    let port_prompt = "Serial port (e.g., ttyUSB0, ttyACM0, ttyS0)";
+    #[cfg(target_os = "macos")]
+    let port_prompt = "Serial port (e.g., cu.usbserial-XXXXX)";
+    
+    let port_name = get_port_name(&prompt(port_prompt));
 
     // ── Prompt: delay in seconds ─────────────────────────────────────────────
     let delay_secs: f64 = loop {
@@ -33,14 +34,6 @@ fn main() {
     };
 
     let delay = Duration::from_secs_f64(delay_secs);
-
-    // ── Build port name ───────────────────────────────────────────────────────
-    // Windows needs \\.\COM10 and above for two-digit ports.
-    let port_name = if port_num >= 10 {
-        format!("\\\\.\\COM{}", port_num)
-    } else {
-        format!("COM{}", port_num)
-    };
 
     // ── Open serial port at 9600 8N1 ─────────────────────────────────────────
     let mut port = serialport::new(&port_name, 9_600)
@@ -110,6 +103,46 @@ fn prompt(msg: &str) -> String {
         .read_line(&mut buf)
         .expect("read_line failed");
     buf.trim_end_matches(['\r', '\n']).to_string()
+}
+
+/// Build the platform-specific port name.
+#[cfg(target_os = "windows")]
+fn get_port_name(input: &str) -> String {
+    // On Windows, accept either a number (1-17) or a full COM port name
+    if let Ok(port_num) = input.trim().parse::<u8>() {
+        if (1..=17).contains(&port_num) {
+            // Windows needs \\.\COM10 and above for two-digit ports
+            return if port_num >= 10 {
+                format!("\\\\.\\COM{}", port_num)
+            } else {
+                format!("COM{}", port_num)
+            };
+        }
+    }
+    // If not a number, assume it's already a full port name
+    input.trim().to_string()
+}
+
+#[cfg(target_os = "linux")]
+fn get_port_name(input: &str) -> String {
+    let trimmed = input.trim();
+    // If user provided just the device name (e.g., "ttyUSB0"), prepend /dev/
+    if !trimmed.starts_with('/') {
+        format!("/dev/{}", trimmed)
+    } else {
+        trimmed.to_string()
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn get_port_name(input: &str) -> String {
+    let trimmed = input.trim();
+    // If user provided just the device name (e.g., "cu.usbserial-1234"), prepend /dev/
+    if !trimmed.starts_with('/') {
+        format!("/dev/{}", trimmed)
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// Mimic the original "Press any key to continue" pause.
