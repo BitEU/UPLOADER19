@@ -6,9 +6,9 @@ use std::fs::File;
 use std::io::BufReader;
 use clap::Parser;
 
-/// UNIVAC Uploader - Send or receive data via serial port
+/// UNIVAC Uploader - Send or receive data via serial port (A sequel to UPLOADER11 written in C)
 #[derive(Parser, Debug)]
-#[command(name = "univac_uploader")]
+#[command(name = "UPLOADER19")]
 #[command(about = "Send or receive data via serial port at 9600 8N1", long_about = None)]
 struct Args {
     /// Mode: send (s) or receive (r)
