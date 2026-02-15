@@ -11,3 +11,4 @@ path = "src/main.rs"
 # Cross-platform serial port library – works on Windows, Linux, macOS.
 # Wraps the Windows CreateFile / SetCommState / WriteFile API internally.
 serialport = "4"
+clap = { version = "4", features = ["derive"] }
