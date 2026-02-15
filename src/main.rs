@@ -184,32 +184,29 @@ fn receive_data(port_arg: Option<String>) {
     println!("Press Ctrl+C to stop receiving.\n");
 
     let mut count: u32 = 0;
-    let mut buffer = [0u8; 128];
+
+    // Read one byte at a time and flush stdout immediately so there is
+    // effectively no user-space buffering of received characters.
+    let mut buffer = [0u8; 1];
 
     loop {
         match port.read(&mut buffer) {
             Ok(bytes_read) if bytes_read > 0 => {
-                // Filter and write bytes like TeraTerm does
-                for &byte in &buffer[..bytes_read] {
-                    // Filter out form feed (0x0C) and other unwanted control characters
-                    // Keep printable ASCII, newline (0x0A), and carriage return (0x0D)
-                    if byte == 0x0C {
-                        // Skip form feed character (displays as ♂)
-                        continue;
-                    } else if byte == 0x0D {
-                        // Skip carriage return, only print line feed
-                        continue;
-                    } else if byte >= 0x20 || byte == 0x0A {
-                        // Printable ASCII (0x20-0x7E) or line feed (0x0A)
-                        io::stdout().write_all(&[byte]).ok();
-                    }
-                    // Skip other control characters
+                let byte = buffer[0];
+
+                // Filter out form feed (0x0C) and carriage return (0x0D);
+                // print printable ASCII and line feed immediately.
+                if byte == 0x0C || byte == 0x0D {
+                    // skip
+                } else if byte >= 0x20 || byte == 0x0A {
+                    let _ = io::stdout().write_all(&[byte]);
+                    let _ = io::stdout().flush();
                 }
-                io::stdout().flush().ok();
+
                 count += bytes_read as u32;
             }
             Ok(_) => {
-                // No data available, continue waiting
+                // No data available; yield briefly.
                 thread::sleep(Duration::from_millis(10));
             }
             Err(ref e) if e.kind() == io::ErrorKind::TimedOut => {
