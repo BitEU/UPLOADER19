@@ -31,12 +31,6 @@ jobs:
             artifact_name: UPLOADER19
             asset_name: UPLOADER19-macos-aarch64
           
-          # macOS Intel (optional, in case you want both)
-          - os: macos-13
-            target: x86_64-apple-darwin
-            artifact_name: UPLOADER19
-            asset_name: UPLOADER19-macos-x86_64
-          
           # Windows (your current platform)
           - os: windows-latest
             target: x86_64-pc-windows-msvc
