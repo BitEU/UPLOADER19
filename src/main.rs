@@ -153,7 +153,6 @@ fn send_data(file_arg: Option<String>, port_arg: Option<String>, delay_arg: Opti
     }
 
     println!("\nDone. Sent {} values to {}.", count, port_name);
-    press_any_key();
 }
 
 fn receive_data(port_arg: Option<String>) {
@@ -221,7 +220,6 @@ fn receive_data(port_arg: Option<String>) {
     }
 
     println!("\nDone. Received {} bytes from {}.", count, port_name);
-    press_any_key();
 }
 
 /// Print a prompt and read a line from stdin.
@@ -278,9 +276,4 @@ fn get_port_name(input: &str) -> String {
 
 /// Mimic the original "Press any key to continue" pause.
 fn press_any_key() {
-    print!("\nPress any key to continue...");
-    io::stdout().flush().expect("flush stdout");
-    // On Windows the terminal will normally close; just wait for Enter.
-    let mut buf = String::new();
-    let _ = io::stdin().lock().read_line(&mut buf);
 }
