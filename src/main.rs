@@ -5,7 +5,7 @@ use std::time::Duration;
 use std::fs::File;
 use std::io::BufReader;
 use clap::Parser;
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal;
 
 /// UNIVAC Uploader - Send or receive data via serial port (A sequel to UPLOADER11 written in C)
@@ -198,6 +198,12 @@ fn receive_data(port_arg: Option<String>) {
         // Poll with a short timeout so we don't block the serial read loop.
         if event::poll(Duration::from_millis(1)).unwrap_or(false) {
             if let Ok(Event::Key(key_event)) = event::read() {
+                // Only handle key press events (not release/repeat),
+                // otherwise each keypress is sent twice on Windows.
+                if key_event.kind != KeyEventKind::Press {
+                    continue;
+                }
+
                 // Ctrl+C to exit
                 if key_event.modifiers.contains(KeyModifiers::CONTROL)
                     && key_event.code == KeyCode::Char('c')

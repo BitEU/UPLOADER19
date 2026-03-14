@@ -43,7 +43,7 @@ Send file:
 UPLOADER19 -m s -f data.76 -p COM4 -d 0.01
 ```
 
-Receive data:
+Receive data (and send data):
 ```
 UPLOADER19 -m r -p COM4
 ```
