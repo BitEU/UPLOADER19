@@ -12,3 +12,4 @@ path = "src/main.rs"
 # Wraps the Windows CreateFile / SetCommState / WriteFile API internally.
 serialport = "4"
 clap = { version = "4", features = ["derive"] }
+crossterm = "0.28"

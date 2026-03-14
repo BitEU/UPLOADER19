@@ -4,8 +4,9 @@ use std::thread;
 use std::time::Duration;
 use std::fs::File;
 use std::io::BufReader;
-use std::sync::mpsc;
 use clap::Parser;
+use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::terminal;
 
 /// UNIVAC Uploader - Send or receive data via serial port (A sequel to UPLOADER11 written in C)
 #[derive(Parser, Debug)]
@@ -183,41 +184,52 @@ fn receive_data(port_arg: Option<String>) {
     println!("Opened {} at 9600 8N1. Interactive terminal (send & receive).", port_name);
     println!("Type to send data. Press Ctrl+C to stop.\n");
 
-    let mut count: u32 = 0;
-
-    // Spawn a background thread to read lines from stdin and send them
-    // to the main loop via a channel.
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
-
-    thread::spawn(move || {
-        let stdin = io::stdin();
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match stdin.lock().read_line(&mut line) {
-                Ok(0) => break, // EOF
-                Ok(_) => {
-                    // Send the raw bytes of whatever the user typed (including newline)
-                    let _ = tx.send(line.as_bytes().to_vec());
-                }
-                Err(_) => break,
-            }
-        }
+    // Enable raw mode so keypresses are sent immediately (no Enter needed).
+    terminal::enable_raw_mode().unwrap_or_else(|e| {
+        eprintln!("ERROR enabling raw terminal mode: {}", e);
+        std::process::exit(1);
     });
 
-    // Read one byte at a time and flush stdout immediately so there is
-    // effectively no user-space buffering of received characters.
+    let mut count: u32 = 0;
     let mut buffer = [0u8; 1];
 
     loop {
         // ── Check for keyboard input to send ─────────────────────────────────
-        if let Ok(data) = rx.try_recv() {
-            for byte in &data {
-                port.write_all(&[*byte]).unwrap_or_else(|e| {
-                    eprintln!("\nERROR writing to serial port: {}", e);
-                });
+        // Poll with a short timeout so we don't block the serial read loop.
+        if event::poll(Duration::from_millis(1)).unwrap_or(false) {
+            if let Ok(Event::Key(key_event)) = event::read() {
+                // Ctrl+C to exit
+                if key_event.modifiers.contains(KeyModifiers::CONTROL)
+                    && key_event.code == KeyCode::Char('c')
+                {
+                    let _ = terminal::disable_raw_mode();
+                    break;
+                }
+
+                // Convert key event to byte(s) and send to serial port
+                let bytes: Vec<u8> = match key_event.code {
+                    KeyCode::Char(c) => {
+                        let mut buf = [0u8; 4];
+                        let s = c.encode_utf8(&mut buf);
+                        s.as_bytes().to_vec()
+                    }
+                    KeyCode::Enter => vec![0x0D],
+                    KeyCode::Backspace => vec![0x08],
+                    KeyCode::Tab => vec![0x09],
+                    KeyCode::Esc => vec![0x1B],
+                    _ => vec![],
+                };
+
+                for byte in &bytes {
+                    port.write_all(&[*byte]).unwrap_or_else(|e| {
+                        let _ = terminal::disable_raw_mode();
+                        eprintln!("\nERROR writing to serial port: {}", e);
+                    });
+                }
+                if !bytes.is_empty() {
+                    let _ = port.flush();
+                }
             }
-            let _ = port.flush();
         }
 
         // ── Read incoming data from serial port ──────────────────────────────
@@ -238,13 +250,13 @@ fn receive_data(port_arg: Option<String>) {
             }
             Ok(_) => {
                 // No data available; yield briefly.
-                thread::sleep(Duration::from_millis(10));
+                thread::sleep(Duration::from_millis(1));
             }
             Err(ref e) if e.kind() == io::ErrorKind::TimedOut => {
-                // Timeout is normal when no data, just continue
                 continue;
             }
             Err(e) => {
+                let _ = terminal::disable_raw_mode();
                 eprintln!("\nERROR reading from serial port: {}", e);
                 break;
             }
