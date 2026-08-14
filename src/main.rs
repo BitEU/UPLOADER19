@@ -174,7 +174,7 @@ fn receive_data(port_arg: Option<String>) {
         .parity(serialport::Parity::None)
         .stop_bits(serialport::StopBits::One)
         .flow_control(serialport::FlowControl::None)
-        .timeout(Duration::from_millis(100))
+        .timeout(Duration::from_millis(10))
         .open()
         .unwrap_or_else(|e| {
             eprintln!("ERROR opening {}: {}", port_name, e);
@@ -192,49 +192,93 @@ fn receive_data(port_arg: Option<String>) {
 
     let mut count: u32 = 0;
     let mut buffer = [0u8; 1];
+    let mut loop_count: u64 = 0;
+    let mut poll_true_count: u64 = 0;
+    let mut read_ok_count: u64 = 0;
+    let mut read_timeout_count: u64 = 0;
+    let mut read_err_count: u64 = 0;
 
-    loop {
+    eprintln!("[DEBUG] raw mode enabled, entering main loop");
+
+    let mut running = true;
+    while running {
+        loop_count += 1;
+
+        // Print debug stats every 1000 loops
+        if loop_count % 5000 == 0 {
+            eprintln!(
+                "\r\n[DEBUG] loops={} polls_true={} read_ok={} read_timeout={} read_err={} bytes={}",
+                loop_count, poll_true_count, read_ok_count, read_timeout_count, read_err_count, count
+            );
+        }
+
         // ── Check for keyboard input to send ─────────────────────────────────
-        // Poll with a short timeout so we don't block the serial read loop.
-        if event::poll(Duration::from_millis(1)).unwrap_or(false) {
-            if let Ok(Event::Key(key_event)) = event::read() {
-                // Only handle key press events (not release/repeat),
-                // otherwise each keypress is sent twice on Windows.
-                if key_event.kind != KeyEventKind::Press {
-                    continue;
-                }
+        match event::poll(Duration::from_millis(1)) {
+            Ok(true) => {
+                poll_true_count += 1;
+                match event::read() {
+                    Ok(Event::Key(key_event)) => {
+                        eprintln!(
+                            "\r\n[DEBUG] key event: code={:?} kind={:?} modifiers={:?}",
+                            key_event.code, key_event.kind, key_event.modifiers
+                        );
 
-                // Ctrl+C to exit
-                if key_event.modifiers.contains(KeyModifiers::CONTROL)
-                    && key_event.code == KeyCode::Char('c')
-                {
-                    let _ = terminal::disable_raw_mode();
-                    break;
-                }
+                        if key_event.kind == KeyEventKind::Press {
+                            // Ctrl+C to exit
+                            if key_event.modifiers.contains(KeyModifiers::CONTROL)
+                                && key_event.code == KeyCode::Char('c')
+                            {
+                                eprintln!("\r\n[DEBUG] Ctrl+C detected, exiting");
+                                let _ = terminal::disable_raw_mode();
+                                running = false;
+                            } else {
+                                // Convert key event to byte(s) and send to serial port
+                                let bytes: Vec<u8> = match key_event.code {
+                                    KeyCode::Char(c) => {
+                                        let mut buf = [0u8; 4];
+                                        let s = c.encode_utf8(&mut buf);
+                                        s.as_bytes().to_vec()
+                                    }
+                                    KeyCode::Enter => vec![0x0D],
+                                    KeyCode::Backspace => vec![0x08],
+                                    KeyCode::Tab => vec![0x09],
+                                    KeyCode::Esc => vec![0x1B],
+                                    _ => vec![],
+                                };
 
-                // Convert key event to byte(s) and send to serial port
-                let bytes: Vec<u8> = match key_event.code {
-                    KeyCode::Char(c) => {
-                        let mut buf = [0u8; 4];
-                        let s = c.encode_utf8(&mut buf);
-                        s.as_bytes().to_vec()
+                                eprintln!("[DEBUG] sending {} bytes to serial: {:?}", bytes.len(), bytes);
+
+                                for byte in &bytes {
+                                    match port.write_all(&[*byte]) {
+                                        Ok(_) => eprintln!("[DEBUG] wrote byte 0x{:02X} ok", byte),
+                                        Err(e) => {
+                                            let _ = terminal::disable_raw_mode();
+                                            eprintln!("\r\n[ERROR] writing to serial port: {}", e);
+                                        }
+                                    }
+                                }
+                                if !bytes.is_empty() {
+                                    match port.flush() {
+                                        Ok(_) => eprintln!("[DEBUG] flush ok"),
+                                        Err(e) => eprintln!("[DEBUG] flush error: {}", e),
+                                    }
+                                }
+                            }
+                        }
                     }
-                    KeyCode::Enter => vec![0x0D],
-                    KeyCode::Backspace => vec![0x08],
-                    KeyCode::Tab => vec![0x09],
-                    KeyCode::Esc => vec![0x1B],
-                    _ => vec![],
-                };
-
-                for byte in &bytes {
-                    port.write_all(&[*byte]).unwrap_or_else(|e| {
-                        let _ = terminal::disable_raw_mode();
-                        eprintln!("\nERROR writing to serial port: {}", e);
-                    });
+                    Ok(other_event) => {
+                        eprintln!("\r\n[DEBUG] non-key event: {:?}", other_event);
+                    }
+                    Err(e) => {
+                        eprintln!("\r\n[DEBUG] event::read() error: {}", e);
+                    }
                 }
-                if !bytes.is_empty() {
-                    let _ = port.flush();
-                }
+            }
+            Ok(false) => {
+                // No input pending, that's fine
+            }
+            Err(e) => {
+                eprintln!("\r\n[DEBUG] event::poll() error: {}", e);
             }
         }
 
@@ -242,6 +286,7 @@ fn receive_data(port_arg: Option<String>) {
         match port.read(&mut buffer) {
             Ok(bytes_read) if bytes_read > 0 => {
                 let byte = buffer[0];
+                read_ok_count += 1;
 
                 // Filter out form feed (0x0C) and carriage return (0x0D);
                 // print printable ASCII and line feed immediately.
@@ -255,16 +300,24 @@ fn receive_data(port_arg: Option<String>) {
                 count += bytes_read as u32;
             }
             Ok(_) => {
-                // No data available; yield briefly.
-                thread::sleep(Duration::from_millis(1));
+                read_timeout_count += 1;
             }
-            Err(ref e) if e.kind() == io::ErrorKind::TimedOut => {
-                continue;
+            Err(ref e) if e.kind() == io::ErrorKind::TimedOut
+                || e.kind() == io::ErrorKind::WouldBlock => {
+                read_timeout_count += 1;
             }
             Err(e) => {
-                let _ = terminal::disable_raw_mode();
-                eprintln!("\nERROR reading from serial port: {}", e);
-                break;
+                read_err_count += 1;
+                eprintln!(
+                    "\r\n[DEBUG] serial read error #{}: {} (kind: {:?})",
+                    read_err_count, e, e.kind()
+                );
+                // Don't exit on first error, keep trying
+                if read_err_count > 10 {
+                    let _ = terminal::disable_raw_mode();
+                    eprintln!("\r\n[ERROR] Too many serial read errors, exiting");
+                    running = false;
+                }
             }
         }
     }
