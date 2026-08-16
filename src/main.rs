@@ -1,14 +1,102 @@
 use std::io::{self, BufRead, Write, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::BufReader;
+use std::sync::{Mutex, OnceLock};
 use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal;
 
 /// UNIVAC Uploader - Send or receive data via serial port (A sequel to UPLOADER11 written in C)
+
+static LOG_FILE: OnceLock<Option<Mutex<File>>> = OnceLock::new();
+
+/// Log file path win: %LOCALAPPDATA%\UPLOADER19\uploader19.log
+/// unix ~/.local/share/UPLOADER19/uploader19.log, otherwise pwd
+fn log_path() -> PathBuf {
+    #[cfg(windows)]
+    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    #[cfg(not(windows))]
+    let base = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share"));
+
+    let mut dir = base.unwrap_or_else(|| PathBuf::from("."));
+    dir.push("UPLOADER19");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.push("uploader19.log");
+    dir
+}
+
+/// Open (append) the global log file exactly once.
+fn init_log() {
+    LOG_FILE.get_or_init(|| {
+        let path = log_path();
+        match OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(f) => Some(Mutex::new(f)),
+            Err(e) => {
+                eprintln!("WARNING: could not open log file {}: {}", path.display(), e);
+                None
+            }
+        }
+    });
+}
+
+/// Buffer for reconstructing received-datastream lines in the log.
+static RECV_BUF: OnceLock<Mutex<String>> = OnceLock::new();
+
+fn log_recv_byte(byte: u8) {
+    let buf = RECV_BUF.get_or_init(|| Mutex::new(String::new()));
+    if let Ok(mut s) = buf.lock() {
+        if byte == 0x0A {
+            let line = std::mem::take(&mut *s);
+            log_line(&format!("[RECV] {}", line));
+        } else {
+            s.push(byte as char);
+        }
+    }
+}
+
+/// Flush any partial received-datastream line still held in the buffer.
+fn flush_recv_buf() {
+    if let Some(buf) = RECV_BUF.get() {
+        if let Ok(mut s) = buf.lock() {
+            if !s.is_empty() {
+                let line = std::mem::take(&mut *s);
+                log_line(&format!("[RECV] {}", line));
+            }
+        }
+    }
+}
+
+/// Append a line to the log file (best effort; ignored if the log is unavailable).
+fn log_line(line: &str) {
+    if let Some(Some(lock)) = LOG_FILE.get() {
+        if let Ok(mut f) = lock.lock() {
+            let _ = writeln!(f, "{}", line);
+            let _ = f.flush();
+        }
+    }
+}
+
+/// Print to stdout AND mirror to the log file.
+macro_rules! log_out {
+    ($($arg:tt)*) => {{
+        let s = format!($($arg)*);
+        println!("{}", s);
+        log_line(&s);
+    }};
+}
+
+/// Print to stderr AND mirror to the log file.
+macro_rules! log_err {
+    ($($arg:tt)*) => {{
+        let s = format!($($arg)*);
+        eprintln!("{}", s);
+        log_line(&s);
+    }};
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "UPLOADER19")]
 #[command(about = "Send or receive data via serial port at 9600 8N1", long_about = None)]
@@ -28,10 +116,27 @@ struct Args {
     /// Delay in seconds between bytes (send mode only)
     #[arg(short, long, value_name = "SECONDS")]
     delay: Option<f64>,
+
+    /// Show the raw datastream instead of a progress bar (send mode)
+    #[arg(short, long)]
+    stream: bool,
 }
 
 fn main() {
     let args = Args::parse();
+
+    // Open the everlasting log and record how this invocation was launched.
+    init_log();
+    log_line("========================================================================");
+    let cli: Vec<String> = std::env::args().collect();
+    log_line(&format!("[RUN] UPLOADER19 started; command line: {}", cli.join(" ")));
+
+    // On the classic Windows console (conhost), ANSI escape sequences are not
+    // processed by default. Ask crossterm to enable virtual-terminal handling
+    // so anything that does emit escapes behaves; the progress bar itself only
+    // uses '\r' and plain ASCII, so it works even if this is unavailable.
+    #[cfg(windows)]
+    let _ = crossterm::ansi_support::supports_ansi();
 
     // ── Prompt: send or receive ──────────────────────────────────────────────
     let mode = if let Some(m) = args.mode {
@@ -39,7 +144,7 @@ fn main() {
             "S" | "SEND" => "SEND",
             "R" | "RECEIVE" => "RECEIVE",
             _ => {
-                eprintln!("Invalid mode. Use 's' or 'send' for Send, 'r' or 'receive' for Receive.");
+                log_err!("Invalid mode. Use 's' or 'send' for Send, 'r' or 'receive' for Receive.");
                 std::process::exit(1);
             }
         }
@@ -49,24 +154,24 @@ fn main() {
             match response.as_str() {
                 "S" | "SEND" => break "SEND",
                 "R" | "RECEIVE" => break "RECEIVE",
-                _ => eprintln!("Please enter 'S' for Send or 'R' for Receive."),
+                _ => log_err!("Please enter 'S' for Send or 'R' for Receive."),
             }
         }
     };
 
     if mode == "SEND" {
-        send_data(args.file, args.port, args.delay);
+        send_data(args.file, args.port, args.delay, args.stream);
     } else {
         receive_data(args.port);
     }
 }
 
-fn send_data(file_arg: Option<String>, port_arg: Option<String>, delay_arg: Option<f64>) {
+fn send_data(file_arg: Option<String>, port_arg: Option<String>, delay_arg: Option<f64>, stream: bool) {
     // ── Prompt: file name ────────────────────────────────────────────────────
     let filename = file_arg.unwrap_or_else(|| prompt("TYPE NAME OF PROGRAM FILE.ext"));
     let path = Path::new(&filename);
     if !path.exists() {
-        eprintln!("ERROR: File '{}' not found.", filename);
+        log_err!("ERROR: File '{}' not found.", filename);
         std::process::exit(1);
     }
 
@@ -85,7 +190,7 @@ fn send_data(file_arg: Option<String>, port_arg: Option<String>, delay_arg: Opti
         if d >= 0.0 {
             d
         } else {
-            eprintln!("Delay must be non-negative.");
+            log_err!("Delay must be non-negative.");
             std::process::exit(1);
         }
     } else {
@@ -93,7 +198,7 @@ fn send_data(file_arg: Option<String>, port_arg: Option<String>, delay_arg: Opti
             let s = prompt("DELAY in seconds");
             match s.trim().parse::<f64>() {
                 Ok(d) if d >= 0.0 => break d,
-                _ => eprintln!("Please enter a non-negative number (e.g. 0.00001)."),
+                _ => log_err!("Please enter a non-negative number (e.g. 0.00001)."),
             }
         }
     };
@@ -109,16 +214,21 @@ fn send_data(file_arg: Option<String>, port_arg: Option<String>, delay_arg: Opti
         .timeout(Duration::from_millis(10))
         .open()
         .unwrap_or_else(|e| {
-            eprintln!("ERROR opening {}: {}", port_name, e);
+            log_err!("ERROR opening {}: {}", port_name, e);
             std::process::exit(1);
         });
 
-    println!("Opened {} at 9600 8N1. Uploading '{}'...", port_name, filename);
+    log_out!("Opened {} at 9600 8N1. Uploading '{}'...", port_name, filename);
+    log_line(&format!(
+        "[SEND] file='{}' port='{}' delay={}s display={}",
+        filename, port_name, delay_secs, if stream { "stream" } else { "progress-bar" }
+    ));
 
-    // The original program printed each value to the console as it was sent.
+    // First pass: read the whole file and collect the valid byte values so we
+    // know the total up front for the progress bar.
     let file = File::open(path).expect("Cannot open file");
     let reader = BufReader::new(file);
-    let mut count: u32 = 0;
+    let mut values: Vec<u8> = Vec::new();
 
     for (line_num, line) in reader.lines().enumerate() {
         let line = line.expect("I/O error reading file");
@@ -127,34 +237,53 @@ fn send_data(file_arg: Option<String>, port_arg: Option<String>, delay_arg: Opti
             continue;
         }
 
-        let value: u8 = match trimmed.parse::<u8>() {
-            Ok(v) => v,
+        match trimmed.parse::<u8>() {
+            Ok(v) => values.push(v),
             Err(_) => {
-                eprintln!("WARNING: Skipping non-numeric value '{}' on line {}", trimmed, line_num + 1);
-                continue;
+                log_err!("WARNING: Skipping non-numeric value '{}' on line {}", trimmed, line_num + 1);
             }
-        };
+        }
+    }
 
-        // Echo value to console, matching the original program's output
-        println!("{}", value);
+    let total = values.len();
+    let mut count: u32 = 0;
 
-        // Send the byte
-        port.write_all(&[value]).unwrap_or_else(|e| {
-            eprintln!("ERROR writing to serial port: {}", e);
-            std::process::exit(1);
-        });
+    // Second pass: send each byte. The raw datastream value is always written to
+    // the log; on-screen it is shown either as the raw stream (--stream) or as
+    // an in-place progress bar (default).
+    for (i, value) in values.iter().enumerate() {
+        // Send the byte, retrying transient timeouts. A stalled output buffer
+        // (e.g. os error 121 "semaphore timeout", or a WouldBlock/TimedOut)
+        // is usually recoverable — the driver just needs a moment to drain.
+        write_byte_with_retry(&mut *port, *value, i + 1, total);
+
         port.flush().unwrap_or_else(|e| {
-            eprintln!("WARNING: flush error: {}", e);
+            log_err!("\nWARNING: flush error: {}", e);
         });
 
         count += 1;
+
+        if stream {
+            // Raw datastream view: echo each value on its own line, like the
+            // original program. log_out! also mirrors it to the file.
+            log_out!("{}", value);
+        } else {
+            // Progress-bar view: console shows the bar; the file still records
+            // every value so the log is a complete datastream either way.
+            log_line(&value.to_string());
+            draw_progress(i + 1, total);
+        }
 
         if delay.as_nanos() > 0 {
             thread::sleep(delay);
         }
     }
 
-    println!("\nDone. Sent {} values to {}.", count, port_name);
+    if !stream {
+        // Move off the progress-bar line before the summary.
+        println!();
+    }
+    log_out!("Done. Sent {} values to {}.", count, port_name);
 }
 
 fn receive_data(port_arg: Option<String>) {
@@ -177,16 +306,18 @@ fn receive_data(port_arg: Option<String>) {
         .timeout(Duration::from_millis(10))
         .open()
         .unwrap_or_else(|e| {
-            eprintln!("ERROR opening {}: {}", port_name, e);
+            log_err!("ERROR opening {}: {}", port_name, e);
             std::process::exit(1);
         });
 
-    println!("Opened {} at 9600 8N1. Interactive terminal (send & receive).", port_name);
-    println!("Type to send data. Press Ctrl+C to stop.\n");
+    log_out!("Opened {} at 9600 8N1. Interactive terminal (send & receive).", port_name);
+    log_out!("Type to send data. Press Ctrl+C to stop.");
+    println!();
+    log_line(&format!("[RECEIVE] port='{}'", port_name));
 
     // Enable raw mode so keypresses are sent immediately (no Enter needed).
     terminal::enable_raw_mode().unwrap_or_else(|e| {
-        eprintln!("ERROR enabling raw terminal mode: {}", e);
+        log_err!("ERROR enabling raw terminal mode: {}", e);
         std::process::exit(1);
     });
 
@@ -199,6 +330,7 @@ fn receive_data(port_arg: Option<String>) {
     let mut read_err_count: u64 = 0;
 
     eprintln!("[DEBUG] raw mode enabled, entering main loop");
+    log_line("[DEBUG] raw mode enabled, entering main loop");
 
     let mut running = true;
     while running {
@@ -206,10 +338,12 @@ fn receive_data(port_arg: Option<String>) {
 
         // Print debug stats every 1000 loops
         if loop_count % 5000 == 0 {
-            eprintln!(
-                "\r\n[DEBUG] loops={} polls_true={} read_ok={} read_timeout={} read_err={} bytes={}",
+            let msg = format!(
+                "[DEBUG] loops={} polls_true={} read_ok={} read_timeout={} read_err={} bytes={}",
                 loop_count, poll_true_count, read_ok_count, read_timeout_count, read_err_count, count
             );
+            eprintln!("\r\n{}", msg);
+            log_line(&msg);
         }
 
         // ── Check for keyboard input to send ─────────────────────────────────
@@ -218,10 +352,12 @@ fn receive_data(port_arg: Option<String>) {
                 poll_true_count += 1;
                 match event::read() {
                     Ok(Event::Key(key_event)) => {
-                        eprintln!(
-                            "\r\n[DEBUG] key event: code={:?} kind={:?} modifiers={:?}",
+                        let msg = format!(
+                            "[DEBUG] key event: code={:?} kind={:?} modifiers={:?}",
                             key_event.code, key_event.kind, key_event.modifiers
                         );
+                        eprintln!("\r\n{}", msg);
+                        log_line(&msg);
 
                         if key_event.kind == KeyEventKind::Press {
                             // Ctrl+C to exit
@@ -229,6 +365,7 @@ fn receive_data(port_arg: Option<String>) {
                                 && key_event.code == KeyCode::Char('c')
                             {
                                 eprintln!("\r\n[DEBUG] Ctrl+C detected, exiting");
+                                log_line("[DEBUG] Ctrl+C detected, exiting");
                                 let _ = terminal::disable_raw_mode();
                                 running = false;
                             } else {
@@ -247,20 +384,31 @@ fn receive_data(port_arg: Option<String>) {
                                 };
 
                                 eprintln!("[DEBUG] sending {} bytes to serial: {:?}", bytes.len(), bytes);
+                                log_line(&format!("[DEBUG] sending {} bytes to serial: {:?}", bytes.len(), bytes));
 
                                 for byte in &bytes {
                                     match port.write_all(&[*byte]) {
-                                        Ok(_) => eprintln!("[DEBUG] wrote byte 0x{:02X} ok", byte),
+                                        Ok(_) => {
+                                            eprintln!("[DEBUG] wrote byte 0x{:02X} ok", byte);
+                                            log_line(&format!("[DEBUG] wrote byte 0x{:02X} ok", byte));
+                                        }
                                         Err(e) => {
                                             let _ = terminal::disable_raw_mode();
                                             eprintln!("\r\n[ERROR] writing to serial port: {}", e);
+                                            log_line(&format!("[ERROR] writing to serial port: {}", e));
                                         }
                                     }
                                 }
                                 if !bytes.is_empty() {
                                     match port.flush() {
-                                        Ok(_) => eprintln!("[DEBUG] flush ok"),
-                                        Err(e) => eprintln!("[DEBUG] flush error: {}", e),
+                                        Ok(_) => {
+                                            eprintln!("[DEBUG] flush ok");
+                                            log_line("[DEBUG] flush ok");
+                                        }
+                                        Err(e) => {
+                                            eprintln!("[DEBUG] flush error: {}", e);
+                                            log_line(&format!("[DEBUG] flush error: {}", e));
+                                        }
                                     }
                                 }
                             }
@@ -268,9 +416,11 @@ fn receive_data(port_arg: Option<String>) {
                     }
                     Ok(other_event) => {
                         eprintln!("\r\n[DEBUG] non-key event: {:?}", other_event);
+                        log_line(&format!("[DEBUG] non-key event: {:?}", other_event));
                     }
                     Err(e) => {
                         eprintln!("\r\n[DEBUG] event::read() error: {}", e);
+                        log_line(&format!("[DEBUG] event::read() error: {}", e));
                     }
                 }
             }
@@ -279,6 +429,7 @@ fn receive_data(port_arg: Option<String>) {
             }
             Err(e) => {
                 eprintln!("\r\n[DEBUG] event::poll() error: {}", e);
+                log_line(&format!("[DEBUG] event::poll() error: {}", e));
             }
         }
 
@@ -295,6 +446,8 @@ fn receive_data(port_arg: Option<String>) {
                 } else if byte >= 0x20 || byte == 0x0A {
                     let _ = io::stdout().write_all(&[byte]);
                     let _ = io::stdout().flush();
+                    // Mirror the raw received byte to the log.
+                    log_recv_byte(byte);
                 }
 
                 count += bytes_read as u32;
@@ -308,21 +461,92 @@ fn receive_data(port_arg: Option<String>) {
             }
             Err(e) => {
                 read_err_count += 1;
-                eprintln!(
-                    "\r\n[DEBUG] serial read error #{}: {} (kind: {:?})",
+                let msg = format!(
+                    "[DEBUG] serial read error #{}: {} (kind: {:?})",
                     read_err_count, e, e.kind()
                 );
+                eprintln!("\r\n{}", msg);
+                log_line(&msg);
                 // Don't exit on first error, keep trying
                 if read_err_count > 10 {
                     let _ = terminal::disable_raw_mode();
                     eprintln!("\r\n[ERROR] Too many serial read errors, exiting");
+                    log_line("[ERROR] Too many serial read errors, exiting");
                     running = false;
                 }
             }
         }
     }
 
-    println!("\nDone. Received {} bytes from {}.", count, port_name);
+    // Flush any partial received line still buffered, then announce the total.
+    flush_recv_buf();
+    println!();
+    log_out!("Done. Received {} bytes from {}.", count, port_name);
+}
+
+/// Write a single byte to the serial port, retrying transient stalls.
+///
+/// Windows raises os error 121 ("The semaphore timeout period has expired.")
+/// when the driver's transmit buffer stays full past its internal timeout —
+/// commonly a flow-control stall on a USB-serial adapter. Such a stall is
+/// almost always transient, so we back off briefly and retry rather than
+/// aborting the whole upload on the first hiccup.
+fn write_byte_with_retry(port: &mut dyn serialport::SerialPort, value: u8, done: usize, total: usize) {
+    const MAX_RETRIES: u32 = 50;
+
+    let mut attempt = 0;
+    loop {
+        match port.write_all(&[value]) {
+            Ok(()) => return,
+            Err(e) => {
+                let transient = e.kind() == io::ErrorKind::TimedOut
+                    || e.kind() == io::ErrorKind::WouldBlock
+                    || e.raw_os_error() == Some(121);
+
+                if transient && attempt < MAX_RETRIES {
+                    attempt += 1;
+                    // Overwrite the progress line with spaces (no ANSI escape,
+                    // so it works on the classic Windows conhost), print the
+                    // retry note, then redraw the bar.
+                    let msg = format!(
+                        "WARNING: serial write stalled at byte {}/{} ({}); retry {}/{}...",
+                        done, total, e, attempt, MAX_RETRIES
+                    );
+                    eprint!("\r{}\r", " ".repeat(72));
+                    eprintln!("{}", msg);
+                    log_line(&msg);
+                    draw_progress(done.saturating_sub(1), total);
+                    thread::sleep(Duration::from_millis(100));
+                } else {
+                    eprintln!("\nERROR writing to serial port: {}", e);
+                    log_line(&format!("[ERROR] writing to serial port: {}", e));
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+}
+
+/// Draw a single-line progress bar in place using a carriage return.
+fn draw_progress(done: usize, total: usize) {
+    const WIDTH: usize = 40;
+
+    if total == 0 {
+        return;
+    }
+
+    let fraction = done as f64 / total as f64;
+    let filled = (fraction * WIDTH as f64).round() as usize;
+    let filled = filled.min(WIDTH);
+    let percent = (fraction * 100.0).round() as u32;
+
+    // Use plain ASCII so the bar renders on any console code page (the classic
+    // Windows conhost may show '?' for Unicode block glyphs). Trailing spaces
+    // pad the line so a shorter redraw fully overwrites a longer previous one,
+    // which avoids relying on an ANSI clear-line escape.
+    let bar: String = "#".repeat(filled) + &"-".repeat(WIDTH - filled);
+    print!("\r[{}] {:3}%  {}/{}   ", bar, percent, done, total);
+    let _ = io::stdout().flush();
 }
 
 /// Print a prompt and read a line from stdin.
@@ -334,7 +558,9 @@ fn prompt(msg: &str) -> String {
         .lock()
         .read_line(&mut buf)
         .expect("read_line failed");
-    buf.trim_end_matches(['\r', '\n']).to_string()
+    let response = buf.trim_end_matches(['\r', '\n']).to_string();
+    log_line(&format!("[PROMPT] {}: {}", msg, response));
+    response
 }
 
 /// Build the platform-specific port name.
